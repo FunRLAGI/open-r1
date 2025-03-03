@@ -19,7 +19,7 @@ catalogue==2.0.10
 certifi==2025.1.31
 chardet==5.2.0
 charset-normalizer==3.4.1
-click @ file:///workspace/pip_wheels/click-8.1.8-py3-none-any.whl
+click == 8.1.8
 cloudpathlib==0.16.0
 cloudpickle==3.1.1
 colorama==0.4.6
@@ -75,7 +75,7 @@ language-data==1.3.0
 lark==1.2.2
 latex2sympy2-extended==1.0.6
 liger-kernel==0.5.3
-lighteval @ file:///workspace/lighteval_new
+lighteval @ git+https://github.com/huggingface/lighteval.git@ed084813e0bd12d82a06d9f913291fdbee774905
 lm-format-enforcer==0.10.10
 lxml==5.3.1
 marisa-trie==1.2.1
@@ -195,7 +195,7 @@ torchvision==0.20.1
 tqdm==4.67.1
 transformers==4.49.0
 triton==3.1.0
-trl @ file:///workspace/trl_new
+trl @ git+https://github.com/huggingface/trl.git@69ad852e5654a77f1695eb4c608906fe0c7e8624
 typepy==1.3.4
 typer==0.9.4
 typing-extensions==4.12.2
@@ -205,7 +205,7 @@ uvicorn==0.34.0
 uvloop==0.21.0
 virtualenv==20.29.2
 vllm==0.7.2
-wandb @ file:///workspace/pip_wheels/wandb-0.19.7-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+wandb==0.19.7
 wasabi==1.1.3
 watchfiles==1.0.4
 wcwidth==0.2.13
