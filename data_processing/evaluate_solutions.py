@@ -17,8 +17,8 @@ results_dir = "./evaluation_results"
 os.makedirs(results_dir, exist_ok=True)
 
 # 定义评估提示模板
-def get_evaluation_prompt(problem, deepseek_solution, qwen_solution):
-    return f"""请评估以下两个解决方案的一致性和准确性：
+ def get_evaluation_prompt(problem, deepseek_solution, qwen_solution):
+    return f"""请严格评估以下两个解决方案的一致性和准确性：
 
 问题：
 {problem}
@@ -30,13 +30,28 @@ def get_evaluation_prompt(problem, deepseek_solution, qwen_solution):
 {qwen_solution}
 
 请分析待评估解决方案是否准确表达了参考解决方案的核心意思。评估应考虑以下几点：
-1. 核心概念的覆盖程度
-2. 关键结论的一致性
-3. 重要细节的准确性
-4. 整体观点的一致性
+1. 核心概念的覆盖程度 - 待评估解决方案是否涵盖了参考解决方案中的所有关键概念
+2. 关键结论的一致性 - 待评估解决方案的结论是否与参考解决方案一致
+3. 重要细节的准确性 - 待评估解决方案中的细节是否与参考解决方案中的细节一致
+4. 整体观点的一致性 - 待评估解决方案的整体观点是否与参考解决方案一致
 
-请给出评分（1-5分，其中1分表示完全不一致，5分表示高度一致）并详细解释理由。
-最后，请明确回答：待评估解决方案是否准确表达了参考解决方案的意思？（是/否）"""
+请严格按照以下标准给出评分（1-5分）：
+1分：完全不一致 - 待评估解决方案与参考解决方案在核心概念、关键结论、重要细节和整体观点上存在根本性差异
+2分：大部分不一致 - 待评估解决方案仅包含少量与参考解决方案一致的内容，大部分内容不一致或有误
+3分：部分一致 - 待评估解决方案包含约一半与参考解决方案一致的内容，但也有明显的遗漏或错误
+4分：大部分一致 - 待评估解决方案包含大部分与参考解决方案一致的内容，仅有少量遗漏或细微差异
+5分：高度一致 - 待评估解决方案几乎完全涵盖参考解决方案的所有核心内容，无明显遗漏或错误
+
+请注意：
+- 避免给出中间评分（如3分）作为默认选择
+- 如果解决方案之间存在明显差异，应给予较低分数（1-2分）
+- 如果解决方案之间基本一致但有少量差异，应给予较高分数（4-5分）
+- 只有当解决方案既有一致的部分又有不一致的部分且大致相当时，才给予3分
+
+请详细解释您的评分理由，针对每个评估点给出具体分析。
+最后，请明确回答：待评估解决方案是否准确表达了参考解决方案的意思？（是/否）
+
+您的评分必须客观公正，避免不必要的宽容，请根据实际一致程度严格评分。"""
 
 # 调用API的函数
 def query_model(prompt, model="deepseek-ai/DeepSeek-V3", max_retries=3):
@@ -45,10 +60,10 @@ def query_model(prompt, model="deepseek-ai/DeepSeek-V3", max_retries=3):
             response = client.chat.completions.create(
                 model=model,
                 messages=[
-                    {"role": "system", "content": "你是一个专业的解决方案评估专家，擅长分析和比较不同解决方案的异同点。"}, 
+                    {"role": "system", "content": "你是一个专业的解决方案评估专家，擅长分析和比较不同解决方案的异同点。你的评估必须客观严格，避免给出中庸的评分。当解决方案之间存在明显差异时，应给予较低分数；当解决方案高度一致时，应给予较高分数。请避免将3分作为默认选择。"}, 
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.3,  # 使用较低的温度以获得更一致的评估
+                temperature=0.1,  # 使用更低的温度以获得更确定性的评估
                 max_tokens=2048
             )
             return response.choices[0].message.content
@@ -75,28 +90,79 @@ def parse_evaluation(evaluation_text):
                 if score:
                     break
         
+        # 如果没有找到明确的评分，尝试从文本中推断
+        if score is None:
+            # 寻找可能包含评分的句子
+            score_indicators = {
+                1: ['1分', '一分', '完全不一致', '根本性差异', '完全不同'],
+                2: ['2分', '二分', '大部分不一致', '主要不一致', '很多错误'],
+                3: ['3分', '三分', '部分一致', '约一半一致', '有明显遗漏'],
+                4: ['4分', '四分', '大部分一致', '基本一致', '少量遗漏'],
+                5: ['5分', '五分', '高度一致', '完全一致', '几乎完全涵盖']
+            }
+            
+            # 计算每个分数的指标出现次数
+            score_counts = {i: 0 for i in range(1, 6)}
+            for score_value, indicators in score_indicators.items():
+                for indicator in indicators:
+                    if indicator in evaluation_text:
+                        score_counts[score_value] += 1
+            
+            # 选择出现次数最多的分数
+            if any(score_counts.values()):
+                max_count = max(score_counts.values())
+                if max_count > 0:
+                    for score_value, count in score_counts.items():
+                        if count == max_count:
+                            score = score_value
+                            break
+        
         # 尝试提取是/否结论
         is_consistent = None
         lower_text = evaluation_text.lower()
+        
+        # 直接寻找明确的是/否回答
         if '是/否' in lower_text or '是否' in lower_text:
-            if '是' in lower_text.split('是/否')[-1].split('\n')[0] or '是' in lower_text.split('是否')[-1].split('\n')[0]:
+            # 获取是/否问题后的文本
+            after_question = lower_text.split('是/否')[-1] if '是/否' in lower_text else lower_text.split('是否')[-1]
+            first_line = after_question.split('\n')[0]
+            
+            if '是' in first_line and '否' not in first_line:
                 is_consistent = True
-            elif '否' in lower_text.split('是/否')[-1].split('\n')[0] or '否' in lower_text.split('是否')[-1].split('\n')[0]:
+            elif '否' in first_line and '是' not in first_line:
                 is_consistent = False
         
         # 如果没有明确找到，尝试从整体评估中推断
         if is_consistent is None:
-            positive_indicators = ['一致', '准确', '相符', '相同', '相似', '表达了']
-            negative_indicators = ['不一致', '不准确', '不相符', '不相同', '不相似', '没有表达']
+            # 扩展指标列表
+            positive_indicators = ['一致', '准确', '相符', '相同', '相似', '表达了', '涵盖', '符合', '吻合']
+            negative_indicators = ['不一致', '不准确', '不相符', '不相同', '不相似', '没有表达', '遗漏', '缺失', '差异', '不符合', '不吻合']
             
-            # 计算正面和负面指标的出现次数
-            positive_count = sum(1 for indicator in positive_indicators if indicator in lower_text)
-            negative_count = sum(1 for indicator in negative_indicators if indicator in lower_text)
+            # 计算正面和负面指标的出现次数，并给予权重
+            positive_count = sum(2 if indicator in lower_text.split('最终')[-1] else 1 
+                               for indicator in positive_indicators if indicator in lower_text)
+            negative_count = sum(2 if indicator in lower_text.split('最终')[-1] else 1 
+                                for indicator in negative_indicators if indicator in lower_text)
             
-            if positive_count > negative_count:
+            if positive_count > negative_count * 1.5:  # 正面指标显著多于负面指标
                 is_consistent = True
-            elif negative_count > positive_count:
+            elif negative_count > positive_count * 1.5:  # 负面指标显著多于正面指标
                 is_consistent = False
+            else:  # 如果指标数量接近，根据评分决定
+                if score is not None:
+                    is_consistent = score >= 4  # 4分及以上认为是一致的
+        
+        # 检查评分与一致性结论是否匹配
+        if score is not None and is_consistent is not None:
+            if (score >= 4 and not is_consistent) or (score <= 2 and is_consistent):
+                print("警告：评分与一致性结论不匹配，可能需要人工审核")
+        
+        # 检查是否存在评分偏向中间值的情况
+        if score == 3:
+            # 检查是否有明确的理由支持3分评分
+            has_clear_reason = '部分一致' in evaluation_text and '部分不一致' in evaluation_text
+            if not has_clear_reason:
+                print("警告：评分为3分但缺乏明确理由，可能需要人工审核")
         
         return {
             "score": score,
@@ -224,8 +290,33 @@ def generate_report(results):
             stats["domain_stats"][domain] = {
                 "count": len(domain_results),
                 "average_score": np.mean(domain_scores) if domain_scores else None,
+                "score_distribution": {i: domain_scores.count(i) for i in range(1, 6)} if domain_scores else {},
                 "consistency_rate": sum(domain_consistency) / len(domain_consistency) if domain_consistency else None
             }
+        
+        # 检测评分偏差
+        bias_warnings = []
+        if scores:
+            # 检查是否有过多的中间评分（3分）
+            middle_score_rate = scores.count(3) / len(scores) if scores else 0
+            if middle_score_rate > 0.4:  # 如果超过40%的评分为3分，发出警告
+                bias_warnings.append(f"警告：有{middle_score_rate*100:.1f}%的评分为3分，可能存在评分偏向中间值的问题")
+            
+            # 检查评分分布是否过于集中
+            most_common_score = max(range(1, 6), key=lambda i: scores.count(i))
+            most_common_rate = scores.count(most_common_score) / len(scores)
+            if most_common_rate > 0.6:  # 如果超过60%的评分为同一个分数，发出警告
+                bias_warnings.append(f"警告：有{most_common_rate*100:.1f}%的评分为{most_common_score}分，评分分布过于集中")
+            
+            # 检查评分与一致性结论是否匹配
+            mismatch_count = sum(1 for i, score in enumerate(scores) if 
+                              consistency[i] is not None and 
+                              ((score >= 4 and not consistency[i]) or (score <= 2 and consistency[i])))
+            if mismatch_count > 0:
+                bias_warnings.append(f"警告：有{mismatch_count}个评分与一致性结论不匹配，可能需要人工审核")
+        
+        # 将警告添加到统计数据中
+        stats["bias_warnings"] = bias_warnings
         
         # 保存统计报告
         report_file = os.path.join(results_dir, "evaluation_report.json")
@@ -244,6 +335,12 @@ def generate_report(results):
         print("\n评分分布:")
         for score, count in stats['score_distribution'].items():
             print(f"  {score}分: {count} 项 ({count/len(scores)*100:.2f}%)")
+        
+        # 打印警告
+        if bias_warnings:
+            print("\n评分偏差警告:")
+            for warning in bias_warnings:
+                print(f"  {warning}")
         
         # 生成详细的HTML报告
         generate_html_report(results, stats)
