@@ -17,7 +17,7 @@ results_dir = "./evaluation_results"
 os.makedirs(results_dir, exist_ok=True)
 
 # 定义评估提示模板
- def get_evaluation_prompt(problem, deepseek_solution, qwen_solution):
+def get_evaluation_prompt(problem, deepseek_solution, qwen_solution):
     return f"""请严格评估以下两个解决方案的一致性和准确性：
 
 问题：
