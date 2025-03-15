@@ -2,18 +2,135 @@ import os
 import json
 import time
 import argparse
-from openai import OpenAI
+import asyncio
+import random
+from openai import OpenAI, AsyncOpenAI
 import numpy as np
 from tqdm import tqdm
 
-# 设置API密钥和基础URL
-client = OpenAI(
-    api_key="sk-zcjkxltmsursqcfqareybswtborbpsdinrnexkhmtxbccotg", 
-    base_url="https://api.siliconflow.cn/v1"
-)
+# 多账号API密钥配置
+API_CONFIGS = [
+    # 添加更多账号配置，格式如下：
+    {
+        "api_key": "sk-zcjkxltmsursqcfqareybswtborbpsdinrnexkhmtxbccotg",
+        "base_url": "https://api.siliconflow.cn/v1"
+    },
+    # 添加更多账号配置，格式如下：
+    {
+        "api_key": "sk-sodcaviuawnqrrhnzixrmjhewcfjkwcsolccpakxugtwjrwb",
+        "base_url": "https://api.siliconflow.cn/v1"
+    },
+    {
+        "api_key": "sk-qkobyqwwlsvlzrsbbwksjkxrkmzzoihbdafgpoduvorwfgdz",
+        "base_url": "https://api.siliconflow.cn/v1"
+    },
+    {
+        "api_key": "sk-fispkvthpyvwcamsgblcgtkuzkjydspjlualwntyykzczizt",
+        "base_url": "https://api.siliconflow.cn/v1"
+    },
+]
+
+# 创建客户端池
+class ClientPool:
+    def __init__(self, api_configs):
+        self.sync_clients = []
+        self.async_clients = []
+        self.client_stats = []  # 用于记录每个客户端的使用情况
+        
+        for config in api_configs:
+            sync_client = OpenAI(
+                api_key=config["api_key"],
+                base_url=config["base_url"]
+            )
+            async_client = AsyncOpenAI(
+                api_key=config["api_key"],
+                base_url=config["base_url"]
+            )
+            
+            self.sync_clients.append(sync_client)
+            self.async_clients.append(async_client)
+            self.client_stats.append({
+                "requests": 0,
+                "tokens": 0,
+                "errors": 0,
+                "last_used": 0
+            })
+    
+    def get_sync_client(self):
+        """获取同步客户端，使用简单的负载均衡策略"""
+        if not self.sync_clients:
+            raise ValueError("没有可用的API客户端")
+        
+        # 选择请求数最少的客户端
+        client_idx = min(range(len(self.client_stats)), 
+                         key=lambda i: self.client_stats[i]["requests"])
+        
+        # 更新统计信息
+        self.client_stats[client_idx]["requests"] += 1
+        self.client_stats[client_idx]["last_used"] = time.time()
+        
+        return self.sync_clients[client_idx], client_idx
+    
+    async def get_async_client(self):
+        """获取异步客户端，使用考虑多因素的负载均衡策略"""
+        if not self.async_clients:
+            raise ValueError("没有可用的API客户端")
+        
+        # 计算每个客户端的权重分数（考虑请求数、错误率和最后使用时间）
+        current_time = time.time()
+        scores = []
+        
+        for i, stats in enumerate(self.client_stats):
+            # 计算时间因子（越久未使用分数越高）
+            time_factor = min(10, current_time - stats["last_used"]) / 10
+            
+            # 计算请求负载因子（请求越少分数越高）
+            if max(s["requests"] for s in self.client_stats) > 0:
+                request_factor = 1 - (stats["requests"] / max(s["requests"] for s in self.client_stats))
+            else:
+                request_factor = 1
+            
+            # 计算错误因子（错误越少分数越高）
+            error_rate = stats["errors"] / max(1, stats["requests"])
+            error_factor = 1 - min(1, error_rate * 10)
+            
+            # 综合分数
+            score = (0.4 * time_factor) + (0.4 * request_factor) + (0.2 * error_factor)
+            scores.append(score)
+        
+        # 选择分数最高的客户端，但加入一些随机性以避免所有请求都集中到一个客户端
+        if random.random() < 0.8:  # 80%的概率选择最佳客户端
+            client_idx = scores.index(max(scores))
+        else:  # 20%的概率随机选择，但权重仍然基于分数
+            total = sum(scores)
+            if total > 0:
+                weights = [s/total for s in scores]
+                client_idx = random.choices(range(len(scores)), weights=weights)[0]
+            else:
+                client_idx = random.randint(0, len(scores)-1)
+        
+        # 更新统计信息
+        self.client_stats[client_idx]["requests"] += 1
+        self.client_stats[client_idx]["last_used"] = current_time
+        
+        return self.async_clients[client_idx], client_idx
+    
+    def update_stats(self, client_idx, tokens=0, error=False):
+        """更新客户端使用统计"""
+        if 0 <= client_idx < len(self.client_stats):
+            self.client_stats[client_idx]["tokens"] += tokens
+            if error:
+                self.client_stats[client_idx]["errors"] += 1
+    
+    def get_stats(self):
+        """获取所有客户端的使用统计"""
+        return self.client_stats
+
+# 创建客户端池
+client_pool = ClientPool(API_CONFIGS)
 
 # 创建结果存储目录
-results_dir = "./evaluation_results"
+results_dir = "./evaluation_results_multi"
 os.makedirs(results_dir, exist_ok=True)
 
 # 定义评估提示模板
@@ -35,7 +152,7 @@ def get_evaluation_prompt(problem, deepseek_solution, qwen_solution):
 3. 重要细节的准确性 - 待评估解决方案中的细节是否与参考解决方案中的细节一致
 4. 整体观点的一致性 - 待评估解决方案的整体观点是否与参考解决方案一致
 
-请严格按照以下标准给出评分（1-5分）：
+请严格执行以下标准给出评分（1-5分）：
 1分：完全不一致 - 待评估解决方案与参考解决方案在核心概念、关键结论、重要细节和整体观点上存在根本性差异
 2分：大部分不一致 - 待评估解决方案仅包含少量与参考解决方案一致的内容，大部分内容不一致或有误
 3分：部分一致 - 待评估解决方案包含约一半与参考解决方案一致的内容，但也有明显的遗漏或错误
@@ -53,11 +170,14 @@ def get_evaluation_prompt(problem, deepseek_solution, qwen_solution):
 
 您的评分必须客观公正，避免不必要的宽容，请根据实际一致程度严格评分。"""
 
-# 调用API的函数
-def query_model(prompt, model="deepseek-ai/DeepSeek-V3", max_retries=3):
+# 异步调用API的函数
+async def query_model_async(prompt, model="deepseek-ai/DeepSeek-V3", max_retries=3):
+    # 获取客户端
+    client, client_idx = await client_pool.get_async_client()
+    
     for attempt in range(max_retries):
         try:
-            response = client.chat.completions.create(
+            response = await client.chat.completions.create(
                 model=model,
                 messages=[
                     {"role": "system", "content": "你是一个专业的解决方案评估专家，擅长分析和比较不同解决方案的异同点。你的评估必须客观严格，避免给出中庸的评分。当解决方案之间存在明显差异时，应给予较低分数；当解决方案高度一致时，应给予较高分数。请避免将3分作为默认选择。"}, 
@@ -66,15 +186,43 @@ def query_model(prompt, model="deepseek-ai/DeepSeek-V3", max_retries=3):
                 temperature=0.1,  # 使用更低的温度以获得更确定性的评估
                 max_tokens=2048
             )
-            return response.choices[0].message.content
+            
+            content = response.choices[0].message.content
+            
+            # 获取token信息
+            input_tokens = response.usage.prompt_tokens
+            output_tokens = response.usage.completion_tokens
+            total_tokens = response.usage.total_tokens
+            
+            # 更新客户端统计信息
+            client_pool.update_stats(client_idx, tokens=total_tokens)
+            
+            return {
+                "content": content,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": total_tokens,
+                "client_idx": client_idx
+            }
+            
         except Exception as e:
-            print(f"API调用错误 (尝试 {attempt+1}/{max_retries}): {e}")
+            print(f"API调用错误 (客户端 {client_idx}, 尝试 {attempt+1}/{max_retries}): {e}")
+            # 更新错误统计
+            client_pool.update_stats(client_idx, error=True)
+            
             if attempt < max_retries - 1:
                 wait_time = 5 * (attempt + 1)  # 指数退避
                 print(f"等待 {wait_time} 秒后重试...")
-                time.sleep(wait_time)
+                await asyncio.sleep(wait_time)
             else:
-                return f"评估失败: {str(e)}"
+                return {
+                    "content": f"评估失败: {str(e)}",
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                    "error": str(e),
+                    "client_idx": client_idx
+                }
 
 # 解析评估结果，提取评分和是否一致的结论
 def parse_evaluation(evaluation_text):
@@ -152,18 +300,6 @@ def parse_evaluation(evaluation_text):
                 if score is not None:
                     is_consistent = score >= 4  # 4分及以上认为是一致的
         
-        # 检查评分与一致性结论是否匹配
-        if score is not None and is_consistent is not None:
-            if (score >= 4 and not is_consistent) or (score <= 2 and is_consistent):
-                print("警告：评分与一致性结论不匹配，可能需要人工审核")
-        
-        # 检查是否存在评分偏向中间值的情况
-        if score == 3:
-            # 检查是否有明确的理由支持3分评分
-            has_clear_reason = '部分一致' in evaluation_text and '部分不一致' in evaluation_text
-            if not has_clear_reason:
-                print("警告：评分为3分但缺乏明确理由，可能需要人工审核")
-        
         return {
             "score": score,
             "is_consistent": is_consistent,
@@ -178,10 +314,57 @@ def parse_evaluation(evaluation_text):
             "parse_error": str(e)
         }
 
-# 处理数据集并评估解决方案
-def evaluate_solutions(input_files, batch_size=10):
+# 处理单个数据项
+async def process_item(item, item_index, total_items):
+    try:
+        # 提取必要字段
+        problem = item['problem']
+        deepseek_solution = item['deepseek_solution']
+        qwen_solution = item['qwen_solution']
+        domain = item.get('domain', '')
+        
+        # 构建评估提示
+        prompt = get_evaluation_prompt(problem, deepseek_solution, qwen_solution)
+        
+        # 调用模型进行评估
+        print(f"\n评估第 {item_index + 1}/{total_items} 条数据")
+        evaluation_result = await query_model_async(prompt)
+        
+        # 解析评估结果
+        parsed_evaluation = parse_evaluation(evaluation_result["content"])
+        
+        # 保存结果
+        result = {
+            "problem": problem,
+            "domain": domain,
+            "evaluation": parsed_evaluation,
+            "item_index": item_index,
+            "token_stats": {
+                "input_tokens": evaluation_result["input_tokens"],
+                "output_tokens": evaluation_result["output_tokens"],
+                "total_tokens": evaluation_result["total_tokens"],
+                "client_idx": evaluation_result.get("client_idx")
+            }
+        }
+        
+        # 打印简短的评估摘要
+        score_str = f"{parsed_evaluation['score']}分" if parsed_evaluation['score'] else "未知分数"
+        consistency_str = "一致" if parsed_evaluation['is_consistent'] else "不一致" if parsed_evaluation['is_consistent'] is not None else "未知"
+        print(f"评估结果: {score_str}, {consistency_str}")
+        
+        return result
+    except Exception as e:
+        print(f"处理数据项时出错: {e}")
+        return {
+            "error": str(e),
+            "item_index": item_index
+        }
+
+# 主处理函数
+async def evaluate_solutions_async(input_files, batch_size=10, concurrent_requests=5):
     all_results = []
     all_items = []
+    token_stats = []
     
     # 加载所有数据
     for input_file in input_files:
@@ -195,62 +378,117 @@ def evaluate_solutions(input_files, batch_size=10):
     
     print(f"总共加载了 {len(all_items)} 条数据")
     
-    # 批量处理数据
-    for batch_idx in range(0, len(all_items), batch_size):
-        batch = all_items[batch_idx:batch_idx + batch_size]
-        batch_results = []
-        
-        for i, item in enumerate(tqdm(batch, desc=f"处理批次 {batch_idx//batch_size + 1}/{(len(all_items)-1)//batch_size + 1}")):
-            try:
-                # 提取必要字段
-                problem = item['problem']
-                deepseek_solution = item['deepseek_solution']
-                qwen_solution = item['qwen_solution']
-                domain = item.get('domain', '')
+    # 计算API限制 (每个账号的限制)
+    rpm_limit = 1000  # 每分钟请求数限制
+    tpm_limit = 50000  # 每分钟token数限制
+    
+    # 每个请求的平均token估计值（初始值，将根据实际使用情况调整）
+    avg_tokens_per_request = 2000
+    
+    # 计算安全的并发请求数 (考虑多账号)
+    account_count = len(API_CONFIGS)
+    safe_concurrent_requests = min(
+        concurrent_requests,
+        (rpm_limit * account_count) // 60,  # 考虑到每分钟的请求限制
+        (tpm_limit * account_count) // (avg_tokens_per_request * 60)  # 考虑token限制
+    )
+    
+    print(f"使用账号数: {account_count}")
+    print(f"使用并发请求数: {safe_concurrent_requests}")
+    
+    try:
+        # 批量处理数据
+        for batch_idx in range(0, len(all_items), batch_size):
+            batch = all_items[batch_idx:batch_idx + batch_size]
+            batch_results = []
+            
+            # 创建任务队列
+            tasks = []
+            for i, item in enumerate(batch):
+                tasks.append(process_item(item, batch_idx + i, len(all_items)))
                 
-                # 构建评估提示
-                prompt = get_evaluation_prompt(problem, deepseek_solution, qwen_solution)
-                
-                # 调用模型进行评估
-                print(f"\n评估第 {batch_idx + i + 1}/{len(all_items)} 条数据")
-                evaluation = query_model(prompt)
-                
-                # 解析评估结果
-                parsed_evaluation = parse_evaluation(evaluation)
-                
-                # 保存结果
-                result = {
-                    "problem": problem,
-                    "domain": domain,
-                    "evaluation": parsed_evaluation,
-                    "item_index": batch_idx + i
-                }
-                batch_results.append(result)
-                all_results.append(result)
-                
-                # 打印简短的评估摘要
-                score_str = f"{parsed_evaluation['score']}分" if parsed_evaluation['score'] else "未知分数"
-                consistency_str = "一致" if parsed_evaluation['is_consistent'] else "不一致" if parsed_evaluation['is_consistent'] is not None else "未知"
-                print(f"评估结果: {score_str}, {consistency_str}")
-                
-                # 避免API限制
-                time.sleep(1)
-                
-            except Exception as e:
-                print(f"处理数据项时出错: {e}")
-                batch_results.append({
-                    "error": str(e),
-                    "item_index": batch_idx + i
-                })
-        
-        # 保存批次结果
-        batch_file = os.path.join(results_dir, f"evaluation_batch_{batch_idx//batch_size}.json")
-        with open(batch_file, 'w', encoding='utf-8') as f:
-            json.dump(batch_results, f, ensure_ascii=False, indent=2)
-        print(f"已保存批次结果到 {batch_file}")
+                # 当任务数达到并发限制或处理到最后一个项目时执行
+                if len(tasks) >= safe_concurrent_requests or i == len(batch) - 1:
+                    # 并行执行任务
+                    results = await asyncio.gather(*tasks)
+                    batch_results.extend(results)
+                    
+                    # 收集token统计信息
+                    batch_tokens = [r.get("token_stats", {}).get("total_tokens", 0) for r in results if "token_stats" in r]
+                    token_stats.extend(batch_tokens)
+                    
+                    # 计算平均token使用量并调整并发请求数
+                    if token_stats:
+                        avg_tokens_per_request = np.mean(token_stats)
+                        new_safe_concurrent_requests = min(
+                            concurrent_requests,
+                            (rpm_limit * account_count) // 60,
+                            (tpm_limit * account_count) // (int(avg_tokens_per_request) * 60)
+                        )
+                        
+                        if new_safe_concurrent_requests != safe_concurrent_requests:
+                            safe_concurrent_requests = new_safe_concurrent_requests
+                            print(f"调整并发请求数为: {safe_concurrent_requests}")
+                    
+                    # 清空任务列表
+                    tasks = []
+                    
+                    # 短暂暂停以避免超过API限制
+                    await asyncio.sleep(0.5)
+            
+            # 保存批次结果
+            all_results.extend(batch_results)
+            batch_file = os.path.join(results_dir, f"evaluation_batch_{batch_idx//batch_size}.json")
+            with open(batch_file, 'w', encoding='utf-8') as f:
+                json.dump(batch_results, f, ensure_ascii=False, indent=2)
+            print(f"已保存批次结果到 {batch_file}")
+            
+            # 打印token使用统计
+            if token_stats:
+                print(f"Token使用统计:")
+                print(f"  平均每条数据总token: {np.mean(token_stats):.2f}")
+                print(f"  最小token: {np.min(token_stats)}")
+                print(f"  最大token: {np.max(token_stats)}")
+                print(f"  中位数token: {np.median(token_stats):.2f}")
+            
+            # 打印客户端使用统计
+            client_stats = client_pool.get_stats()
+            print(f"客户端使用统计:")
+            for i, stats in enumerate(client_stats):
+                print(f"  客户端 {i}: 请求数={stats['requests']}, token数={stats['tokens']}, 错误数={stats['errors']}")
+    
+    except KeyboardInterrupt:
+        print("处理被用户中断")
+        # 保存已处理的结果
+        if all_results:
+            interrupt_file = os.path.join(results_dir, f"evaluation_interrupted.json")
+            with open(interrupt_file, 'w', encoding='utf-8') as f:
+                json.dump(all_results, f, ensure_ascii=False, indent=2)
+            print(f"已保存中断时的结果到 {interrupt_file}")
     
     # 生成统计报告
     generate_report(all_results)
+    
+    # 保存token使用统计
+    if token_stats:
+        stats_file = os.path.join(results_dir, "token_stats.json")
+        with open(stats_file, 'w', encoding='utf-8') as f:
+            json.dump({
+                "average_tokens_per_item": float(np.mean(token_stats)),
+                "min_tokens": int(np.min(token_stats)),
+                "max_tokens": int(np.max(token_stats)),
+                "median_tokens": float(np.median(token_stats)),
+                "total_tokens": int(np.sum(token_stats)),
+                "item_count": len(token_stats),
+                "detailed_stats": token_stats
+            }, f, ensure_ascii=False, indent=2)
+        print(f"已保存token统计信息到 {stats_file}")
+    
+    # 保存客户端使用统计
+    client_stats_file = os.path.join(results_dir, "client_stats.json")
+    with open(client_stats_file, 'w', encoding='utf-8') as f:
+        json.dump(client_pool.get_stats(), f, ensure_ascii=False, indent=2)
+    print(f"已保存客户端统计信息到 {client_stats_file}")
     
     return all_results
 
@@ -310,7 +548,7 @@ def generate_report(results):
             
             # 检查评分与一致性结论是否匹配
             mismatch_count = sum(1 for i, score in enumerate(scores) if 
-                              consistency[i] is not None and 
+                              i < len(consistency) and consistency[i] is not None and 
                               ((score >= 4 and not consistency[i]) or (score <= 2 and consistency[i])))
             if mismatch_count > 0:
                 bias_warnings.append(f"警告：有{mismatch_count}个评分与一致性结论不匹配，可能需要人工审核")
@@ -343,7 +581,7 @@ def generate_report(results):
                 print(f"  {warning}")
         
         # 生成详细的HTML报告
-        generate_html_report(results, stats)
+        generate_html_report(valid_results, stats)
         
     except Exception as e:
         print(f"生成报告时出错: {e}")
@@ -380,8 +618,8 @@ def generate_html_report(results, stats):
         <h2>评估摘要</h2>
         <p>总数据项: {stats['total_items']}</p>
         <p>有效评估: {stats['valid_evaluations']}</p>
-        <p>平均评分: {stats['average_score']:.2f}/5.0</p>
-        <p>一致性比率: {stats['consistency_rate']*100:.2f}%</p>
+        <p>平均评分: {stats['average_score']:.2f if stats['average_score'] else 'N/A'}/5.0</p>
+        <p>一致性比率: {stats['consistency_rate']*100:.2f if stats['consistency_rate'] is not None else 'N/A'}%</p>
     </div>
     
     <h2>评分分布</h2>
@@ -429,7 +667,7 @@ def generate_html_report(results, stats):
             </td>
             <td>{r['problem'][:100]}...</td>
         </tr>
-            """ for r in valid_results])
+            """ for r in results])
         }}
     </table>
     
@@ -490,211 +728,45 @@ def generate_html_report(results, stats):
     except Exception as e:
         print(f"生成HTML报告时出错: {e}")
 
-# 评估qwen_solution_w_reasoning与deepseek_solution的一致性
-def evaluate_solutions_with_reasoning(input_files, batch_size=10):
-    # 类似evaluate_solutions函数，但使用qwen_solution_w_reasoning而不是qwen_solution
+# 合并所有批次结果
+def merge_results():
     all_results = []
-    all_items = []
+    for filename in os.listdir(results_dir):
+        if filename.startswith("evaluation_batch_") and filename.endswith(".json"):
+            file_path = os.path.join(results_dir, filename)
+            with open(file_path, 'r', encoding='utf-8') as f:
+                batch_results = json.load(f)
+                all_results.extend(batch_results)
     
-    # 加载所有数据
-    for input_file in input_files:
-        try:
-            with open(input_file, 'r', encoding='utf-8') as f:
-                items = json.load(f)
-                all_items.extend(items)
-                print(f"从 {input_file} 加载了 {len(items)} 条数据")
-        except Exception as e:
-            print(f"加载文件 {input_file} 时出错: {e}")
-    
-    print(f"总共加载了 {len(all_items)} 条数据")
-    
-    # 批量处理数据
-    for batch_idx in range(0, len(all_items), batch_size):
-        batch = all_items[batch_idx:batch_idx + batch_size]
-        batch_results = []
-        
-        for i, item in enumerate(tqdm(batch, desc=f"处理批次 {batch_idx//batch_size + 1}/{(len(all_items)-1)//batch_size + 1}")):
-            try:
-                # 提取必要字段
-                problem = item['problem']
-                deepseek_solution = item['deepseek_solution']
-                qwen_solution_w_reasoning = item['qwen_solution_w_reasoning']  # 使用带推理的解决方案
-                domain = item.get('domain', '')
-                
-                # 构建评估提示
-                prompt = get_evaluation_prompt(problem, deepseek_solution, qwen_solution_w_reasoning)
-                
-                # 调用模型进行评估
-                print(f"\n评估第 {batch_idx + i + 1}/{len(all_items)} 条数据 (带推理)")
-                evaluation = query_model(prompt)
-                
-                # 解析评估结果
-                parsed_evaluation = parse_evaluation(evaluation)
-                
-                # 保存结果
-                result = {
-                    "problem": problem,
-                    "domain": domain,
-                    "evaluation": parsed_evaluation,
-                    "item_index": batch_idx + i,
-                    "with_reasoning": True
-                }
-                batch_results.append(result)
-                all_results.append(result)
-                
-                # 打印简短的评估摘要
-                score_str = f"{parsed_evaluation['score']}分" if parsed_evaluation['score'] else "未知分数"
-                consistency_str = "一致" if parsed_evaluation['is_consistent'] else "不一致" if parsed_evaluation['is_consistent'] is not None else "未知"
-                print(f"评估结果 (带推理): {score_str}, {consistency_str}")
-                
-                # 避免API限制
-                time.sleep(1)
-                
-            except Exception as e:
-                print(f"处理数据项时出错: {e}")
-                batch_results.append({
-                    "error": str(e),
-                    "item_index": batch_idx + i,
-                    "with_reasoning": True
-                })
-        
-        # 保存批次结果
-        batch_file = os.path.join(results_dir, f"evaluation_with_reasoning_batch_{batch_idx//batch_size}.json")
-        with open(batch_file, 'w', encoding='utf-8') as f:
-            json.dump(batch_results, f, ensure_ascii=False, indent=2)
-        print(f"已保存批次结果到 {batch_file}")
+    # 保存合并结果
+    merged_file = os.path.join(results_dir, "all_evaluation_results.json")
+    with open(merged_file, 'w', encoding='utf-8') as f:
+        json.dump(all_results, f, ensure_ascii=False, indent=2)
+    print(f"已合并所有结果到 {merged_file}")
     
     # 生成统计报告
-    generate_report_with_reasoning(all_results)
+    generate_report(all_results)
     
     return all_results
 
-# 生成带推理的评估统计报告
-def generate_report_with_reasoning(results):
-    # 类似generate_report函数，但针对带推理的评估结果
-    try:
-        # 过滤掉有错误的结果
-        valid_results = [r for r in results if 'evaluation' in r and 'error' not in r]
-        
-        # 提取评分和一致性结果
-        scores = [r['evaluation']['score'] for r in valid_results if r['evaluation']['score'] is not None]
-        consistency = [r['evaluation']['is_consistent'] for r in valid_results if r['evaluation']['is_consistent'] is not None]
-        
-        # 按领域分组
-        domains = {}
-        for r in valid_results:
-            domain = r.get('domain', 'unknown')
-            if domain not in domains:
-                domains[domain] = []
-            domains[domain].append(r)
-        
-        # 计算统计数据
-        stats = {
-            "total_items": len(results),
-            "valid_evaluations": len(valid_results),
-            "average_score": np.mean(scores) if scores else None,
-            "score_distribution": {i: scores.count(i) for i in range(1, 6)},
-            "consistency_rate": sum(consistency) / len(consistency) if consistency else None,
-            "domain_stats": {}
-        }
-        
-        # 计算每个领域的统计数据
-        for domain, domain_results in domains.items():
-            domain_scores = [r['evaluation']['score'] for r in domain_results if r['evaluation']['score'] is not None]
-            domain_consistency = [r['evaluation']['is_consistent'] for r in domain_results if r['evaluation']['is_consistent'] is not None]
-            
-            stats["domain_stats"][domain] = {
-                "count": len(domain_results),
-                "average_score": np.mean(domain_scores) if domain_scores else None,
-                "consistency_rate": sum(domain_consistency) / len(domain_consistency) if domain_consistency else None
-            }
-        
-        # 保存统计报告
-        report_file = os.path.join(results_dir, "evaluation_with_reasoning_report.json")
-        with open(report_file, 'w', encoding='utf-8') as f:
-            json.dump(stats, f, ensure_ascii=False, indent=2)
-        print(f"已保存带推理的评估报告到 {report_file}")
-        
-        # 打印摘要
-        print("\n带推理的评估摘要:")
-        print(f"总数据项: {stats['total_items']}")
-        print(f"有效评估: {stats['valid_evaluations']}")
-        if stats['average_score']:
-            print(f"平均评分: {stats['average_score']:.2f}/5.0")
-        if stats['consistency_rate'] is not None:
-            print(f"一致性比率: {stats['consistency_rate']*100:.2f}%")
-        print("\n评分分布:")
-        for score, count in stats['score_distribution'].items():
-            print(f"  {score}分: {count} 项 ({count/len(scores)*100:.2f}%)")
-        
-    except Exception as e:
-        print(f"生成带推理的报告时出错: {e}")
-
-# 比较有无推理的评估结果
-def compare_evaluations(input_files, batch_size=10):
-    # 评估不带推理的解决方案
-    print("\n===== 评估不带推理的解决方案 =====\n")
-    results_without_reasoning = evaluate_solutions(input_files, batch_size)
-    
-    # 评估带推理的解决方案
-    print("\n===== 评估带推理的解决方案 =====\n")
-    results_with_reasoning = evaluate_solutions_with_reasoning(input_files, batch_size)
-    
-    # 比较结果
-    print("\n===== 比较评估结果 =====\n")
-    
-    # 提取有效结果
-    valid_without = [r for r in results_without_reasoning if 'evaluation' in r and 'error' not in r and r['evaluation']['score'] is not None]
-    valid_with = [r for r in results_with_reasoning if 'evaluation' in r and 'error' not in r and r['evaluation']['score'] is not None]
-    
-    # 计算平均分数
-    avg_score_without = np.mean([r['evaluation']['score'] for r in valid_without])
-    avg_score_with = np.mean([r['evaluation']['score'] for r in valid_with])
-    
-    # 计算一致性比率
-    consistency_without = [r['evaluation']['is_consistent'] for r in valid_without if r['evaluation']['is_consistent'] is not None]
-    consistency_with = [r['evaluation']['is_consistent'] for r in valid_with if r['evaluation']['is_consistent'] is not None]
-    
-    consistency_rate_without = sum(consistency_without) / len(consistency_without) if consistency_without else None
-    consistency_rate_with = sum(consistency_with) / len(consistency_with) if consistency_with else None
-    
-    # 打印比较结果
-    print(f"不带推理的平均评分: {avg_score_without:.2f}/5.0")
-    print(f"带推理的平均评分: {avg_score_with:.2f}/5.0")
-    print(f"评分差异: {avg_score_with - avg_score_without:.2f}")
-    
-    print(f"\n不带推理的一致性比率: {consistency_rate_without*100:.2f}%")
-    print(f"带推理的一致性比率: {consistency_rate_with*100:.2f}%")
-    print(f"一致性比率差异: {(consistency_rate_with - consistency_rate_without)*100:.2f}%")
-
 # 主函数
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="评估Qwen解决方案与DeepSeek解决方案的一致性")
-    parser.add_argument("--input", "-i", nargs="+", default=["./qwen_results/results_batch_0.json", "./qwen_results/results_batch_1.json"],
-                        help="输入JSON文件路径，可以指定多个文件")
-    parser.add_argument("--batch_size", "-b", type=int, default=10,
-                        help="批处理大小，每处理多少条数据保存一次结果")
-    parser.add_argument("--compare", "-c", action="store_true",
-                        help="是否比较带推理和不带推理的解决方案")
-    parser.add_argument("--only_with_reasoning", "-r", action="store_true",
-                        help="是否只评估带推理的解决方案")
-    parser.add_argument("--only_without_reasoning", "-w", action="store_true",
-                        help="是否只评估不带推理的解决方案")
-    
+def main():
+    parser = argparse.ArgumentParser(description='使用多账号并行评估解决方案')
+    # parser.add_argument('input_files', nargs='+', help='输入文件路径，包含要评估的解决方案')
+    parser.add_argument('--batch-size', type=int, default=10, help='批处理大小')
+    parser.add_argument('--concurrent', type=int, default=5, help='并发请求数')
+    parser.add_argument('--merge-only', action='store_true', help='仅合并已有的批次结果')
     args = parser.parse_args()
+
+    input_files = ["qwen_results/results_batch_{}.json".format(i) for i in range(50)]
     
-    if args.compare:
-        # 比较带推理和不带推理的解决方案
-        compare_evaluations(args.input, args.batch_size)
-    elif args.only_with_reasoning:
-        # 只评估带推理的解决方案
-        evaluate_solutions_with_reasoning(args.input, args.batch_size)
-    elif args.only_without_reasoning:
-        # 只评估不带推理的解决方案
-        evaluate_solutions(args.input, args.batch_size)
+    if args.merge_only:
+        print("仅合并已有的批次结果...")
+        merge_results()
     else:
-        # 默认评估两个解决方案
-        evaluate_solutions(args.input, args.batch_size)
-        evaluate_solutions_with_reasoning(args.input, args.batch_size)
-    
-    print("\n评估完成！结果已保存到", results_dir)
+        print(f"开始评估解决方案，使用 {len(API_CONFIGS)} 个账号...")
+        # asyncio.run(evaluate_solutions_async(args.input_files, args.batch_size, args.concurrent))
+        asyncio.run(evaluate_solutions_async(input_files, args.batch_size, args.concurrent))
+
+if __name__ == "__main__":
+    main()
