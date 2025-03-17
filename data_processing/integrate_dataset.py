@@ -8,12 +8,13 @@ from tqdm import tqdm
 # 定义路径
 QWEN_RESULTS_DIR = "./qwen_results"
 EVALUATION_RESULTS_DIR = "./evaluation_results_multi"
-OUTPUT_FILE = "./integrated_dataset.parquet"
+OUTPUT_FILE = "./OpenThoughts-114k-Qwen2.5-7B-Instruct-evaluated-general-4.9k/integrated_dataset.parquet"
 
 # 加载原始数据集
 print("加载原始数据集...")
 dataset = load_dataset("./OpenThoughts-114k/data", split="train")
 print(f"原始数据集大小: {len(dataset)}")
+print(f"原始数据集示例: {dataset[0].keys()}")
 
 # 创建索引字典，用于快速查找
 dataset_dict = {i: item for i, item in enumerate(dataset)}
@@ -69,20 +70,15 @@ for idx in tqdm(range(len(dataset)), desc="整合数据"):
         item = dataset_dict[idx]
         
         # 创建新的数据项
-        new_item = {
-            "item_index": idx,
-            "problem": item["problem"],
-            "deepseek_reasoning": item.get("deepseek_reasoning", ""),
-            "deepseek_solution": item.get("deepseek_solution", ""),
-            "qwen_solution": qwen_results[idx]["qwen_solution"],
-            "qwen_solution_w_reasoning": qwen_results[idx]["qwen_solution_w_reasoning"],
-            "evaluation": evaluation_results[idx]["evaluation"],
-            "domain": item.get("domain", "")
-        }
+        new_item = item
+        new_item["qwen_solution"] = qwen_results[idx]["qwen_solution"]
+        new_item["qwen_solution_w_reasoning"] = qwen_results[idx]["qwen_solution_w_reasoning"]
+        new_item["evaluation"] = evaluation_results[idx]["evaluation"]
         
         integrated_data.append(new_item)
 
 print(f"整合了 {len(integrated_data)} 条数据")
+print(f"整合后数据集示例: {integrated_data[0].keys()}")
 
 # 转换为DataFrame并保存
 df = pd.DataFrame(integrated_data)
