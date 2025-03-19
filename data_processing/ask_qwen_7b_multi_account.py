@@ -8,26 +8,43 @@ from openai import OpenAI, AsyncOpenAI
 from tqdm import tqdm
 import numpy as np
 
-# 多账号API密钥配置
-API_CONFIGS = [
-    {
-        "api_key": "sk-zcjkxltmsursqcfqareybswtborbpsdinrnexkhmtxbccotg",
-        "base_url": "https://api.siliconflow.cn/v1"
-    },
-    # 添加更多账号配置，格式如下：
-    {
-        "api_key": "sk-sodcaviuawnqrrhnzixrmjhewcfjkwcsolccpakxugtwjrwb",
-        "base_url": "https://api.siliconflow.cn/v1"
-    },
-    {
-        "api_key": "sk-qkobyqwwlsvlzrsbbwksjkxrkmzzoihbdafgpoduvorwfgdz",
-        "base_url": "https://api.siliconflow.cn/v1"
-    },
-    {
-        "api_key": "sk-fispkvthpyvwcamsgblcgtkuzkjydspjlualwntyykzczizt",
-        "base_url": "https://api.siliconflow.cn/v1"
-    },
-]
+# 加载配置文件
+CONFIG_PATH = "./config.json"
+with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    CONFIG = json.load(f)
+
+# 指定使用的模型
+MODEL_NAME = "Qwen2.5-7B-Instruct"
+
+# 从配置文件中获取API配置和模型配置
+def get_api_configs_for_model(config, model_name):
+    """根据模型名称获取可用的API配置"""
+    api_configs = []
+    model_config = config["model_configs"].get(model_name, {})
+    providers_config = model_config.get("providers", {})
+    
+    # 遍历所有可用的提供商
+    for provider_name, provider_config in providers_config.items():
+        # 获取该提供商的模型名称和限制
+        model_name_for_provider = provider_config.get("model_name")
+        rpm_limit = provider_config.get("rpm_limit")
+        tpm_limit = provider_config.get("tpm_limit")
+        
+        # 查找该提供商的API配置
+        for api_config in config["api_configs"]:
+            if api_config["provider"] == provider_name:
+                # 创建新的API配置，包含模型信息
+                new_config = api_config.copy()
+                new_config["model_name"] = model_name_for_provider
+                new_config["rpm_limit"] = rpm_limit
+                new_config["tpm_limit"] = tpm_limit
+                api_configs.append(new_config)
+    
+    return api_configs
+
+# 获取指定模型的API配置
+API_CONFIGS = get_api_configs_for_model(CONFIG, MODEL_NAME)
+print(f"为模型 {MODEL_NAME} 找到 {len(API_CONFIGS)} 个可用API配置")
 
 # 创建客户端池
 class ClientPool:
@@ -35,6 +52,7 @@ class ClientPool:
         self.sync_clients = []
         self.async_clients = []
         self.client_stats = []  # 用于记录每个客户端的使用情况
+        self.api_configs = api_configs  # 存储API配置信息
         
         for config in api_configs:
             sync_client = OpenAI(
@@ -52,7 +70,9 @@ class ClientPool:
                 "requests": 0,
                 "tokens": 0,
                 "errors": 0,
-                "last_used": 0
+                "last_used": 0,
+                "rpm_limit": config.get("rpm_limit", 0),
+                "tpm_limit": config.get("tpm_limit", 0)
             })
     
     def get_sync_client(self):
@@ -75,9 +95,13 @@ class ClientPool:
         if not self.async_clients:
             raise ValueError("没有可用的API客户端")
         
-        # 计算每个客户端的权重分数（考虑请求数、错误率和最后使用时间）
+        # 计算每个客户端的权重分数（考虑请求数、错误率、最后使用时间和API限制）
         current_time = time.time()
         scores = []
+        
+        # 获取最大rpm和tpm限制，用于归一化
+        max_rpm = max(stats["rpm_limit"] for stats in self.client_stats) if any(stats["rpm_limit"] > 0 for stats in self.client_stats) else 1
+        max_tpm = max(stats["tpm_limit"] for stats in self.client_stats) if any(stats["tpm_limit"] > 0 for stats in self.client_stats) else 1
         
         for i, stats in enumerate(self.client_stats):
             # 计算时间因子（越久未使用分数越高）
@@ -93,8 +117,13 @@ class ClientPool:
             error_rate = stats["errors"] / max(1, stats["requests"])
             error_factor = 1 - min(1, error_rate * 10)
             
-            # 综合分数
-            score = (0.4 * time_factor) + (0.4 * request_factor) + (0.2 * error_factor)
+            # 计算API限制因子（限制越高分数越高）
+            rpm_factor = stats["rpm_limit"] / max_rpm if max_rpm > 0 else 0
+            tpm_factor = stats["tpm_limit"] / max_tpm if max_tpm > 0 else 0
+            limit_factor = (rpm_factor + tpm_factor) / 2
+            
+            # 综合分数（增加API限制因子的权重）
+            score = (0.3 * time_factor) + (0.3 * request_factor) + (0.1 * error_factor) + (0.3 * limit_factor)
             scores.append(score)
         
         # 选择分数最高的客户端，但加入一些随机性以避免所有请求都集中到一个客户端
@@ -128,13 +157,14 @@ class ClientPool:
 # 创建客户端池
 client_pool = ClientPool(API_CONFIGS)
 
-# 加载数据集
-dataset = load_dataset("./OpenThoughts-114k/data", split="train")
+# 从配置文件中获取数据集路径和结果目录
+dataset_config = CONFIG.get("dataset", {"path": "openthoughts/OpenThoughts-114k", "split": "train", "start_index": 0})
+dataset = load_dataset(dataset_config["path"], split=dataset_config.get("split", "train"))
 print(f"数据集大小: {len(dataset)}")
 print(f"数据集字段: {dataset[0].keys()}")
 
 # 创建结果存储目录
-results_dir = "./qwen_results"
+results_dir = CONFIG.get("results_dir", f"./qwen_results_{MODEL_NAME.lower().replace('.', '_').replace('-', '_')}")
 os.makedirs(results_dir, exist_ok=True)
 
 # 定义提示模板
@@ -156,7 +186,7 @@ def get_prompt_with_reasoning(problem, reasoning):
 请给出你的最终答案。"""
 
 # 调用API的函数
-async def query_qwen_async(prompt, model="Qwen/Qwen2.5-7B-Instruct"):
+async def query_qwen_async(prompt, model=None):
     # 获取客户端
     client, client_idx = await client_pool.get_async_client()
     
@@ -167,9 +197,12 @@ async def query_qwen_async(prompt, model="Qwen/Qwen2.5-7B-Instruct"):
             {"role": "user", "content": prompt}
         ]
         
+        # 获取模型名称（从API配置中获取对应客户端的模型名称）
+        model_name = client_pool.api_configs[client_idx]["model_name"] if model is None else model
+        
         # 异步调用API
         response = await client.chat.completions.create(
-            model=model,
+            model=model_name,
             messages=messages,
             temperature=0.7,
             max_tokens=4096
@@ -263,9 +296,18 @@ async def process_dataset(batch_size=100, concurrent_requests=5):
     results = []
     token_stats = []
     
-    # 计算API限制 (每个账号的限制)
-    rpm_limit = 1000  # 每分钟请求数限制
-    tpm_limit = 50000  # 每分钟token数限制
+    # 计算API限制（考虑多个提供商的不同限制）
+    rpm_limits = [config.get("rpm_limit", 0) for config in API_CONFIGS]
+    tpm_limits = [config.get("tpm_limit", 0) for config in API_CONFIGS]
+    
+    # 使用加权平均计算有效限制
+    # 对于每个客户端，计算其限制占总限制的比例，然后根据这个比例分配请求
+    total_rpm_weight = sum(rpm for rpm in rpm_limits if rpm > 0)
+    total_tpm_weight = sum(tpm for tpm in tpm_limits if tpm > 0)
+    
+    # 计算有效的RPM和TPM限制（考虑不同客户端的限制差异）
+    rpm_limit = max(rpm_limits) if total_rpm_weight > 0 else 0
+    tpm_limit = max(tpm_limits) if total_tpm_weight > 0 else 0
     
     # 每个请求的平均token估计值（初始值，将根据实际使用情况调整）
     avg_tokens_per_request = 1000
@@ -285,7 +327,7 @@ async def process_dataset(batch_size=100, concurrent_requests=5):
         # 创建任务队列
         tasks = []
         for i, item in enumerate(dataset):
-            if i < 200:
+            if i < CONFIG["dataset"]["start_index"]:
                 continue
             tasks.append(process_item(item, i, len(dataset)))
             
